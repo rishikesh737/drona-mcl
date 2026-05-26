@@ -1,0 +1,220 @@
+# Drona-MCL
+
+**Drona** is a fully local, autonomous Linux SysAdmin agent powered by small open-source models running via [Ollama](https://ollama.com). No data leaves your machine.
+
+Its defining innovation is the **Model Compliance Layer (MCL)** — a model-agnostic dispatch layer that makes small local models (3B–7B parameters) reliable agentic participants even when they don't follow the structured tool-calling API correctly.
+
+---
+
+## Why the MCL exists
+
+Large Language Models exposed via the Ollama API support a structured tool-calling interface (`response.message.tool_calls`). In practice, small local models frequently ignore this schema and instead output raw JSON text, markdown-fenced JSON, or other freeform representations. This causes naive agentic systems to silently fail.
+
+The MCL handles **both** output styles:
+
+| Path | Trigger | Action |
+|------|---------|--------|
+| **Path A** (Compliant) | Model populates `tool_calls` field | Extracts and dispatches directly |
+| **Path B** (Non-Compliant) | Model outputs freeform text | Strips fences → extracts JSON → normalises schema → dispatches |
+
+### Fence variants handled by Path B
+
+| # | Format | Example |
+|---|--------|---------|
+| 1 | Standard backtick + language tag | ` ```json { ... } ``` ` |
+| 2 | Backtick, no language tag | ` ``` { ... } ``` ` |
+| 3 | Triple-brace | `{{{ { ... } }}}` |
+| 4 | Raw JSON | `{ "name": ..., "arguments": ... }` |
+| 5 | Prose-wrapped | `"Sure! Here is the call: { ... }"` |
+
+### Tool-call schema normalisation
+
+Different small models use different key names. The MCL normalises all of them:
+
+| Model output | Normalised to |
+|---|---|
+| `{"name": ..., "arguments": ...}` | canonical |
+| `{"tool": ..., "parameters": ...}` | ✓ |
+| `{"function": ..., "arguments": ...}` | ✓ |
+| `{"function_name": ..., "arguments": ...}` | ✓ |
+| `{"action": ..., "action_input": ...}` (ReAct) | ✓ |
+
+---
+
+## Quick start
+
+### Prerequisites
+
+- Python 3.10+
+- [Ollama](https://ollama.com/download) installed and running
+- `bash` (for script validation)
+
+### 1. Clone and bootstrap
+
+```bash
+git clone https://github.com/your-org/drona-mcl.git
+cd drona-mcl
+chmod +x setup.sh
+./setup.sh
+```
+
+`setup.sh` will:
+- Create a `.venv` virtual environment
+- Install all dependencies
+- Pull the configured Ollama model (`qwen2.5:7b` by default)
+- Run the test suite
+
+### 2. Activate the environment
+
+```bash
+source .venv/bin/activate
+```
+
+### 3. Run Drona
+
+```bash
+python main.py "Why is nginx failing?"
+python main.py "Check disk usage on all mounts"
+python main.py "List all failed systemd services and their recent logs"
+python main.py --verbose "Create a script to rotate logs older than 30 days"
+```
+
+---
+
+## Configuration
+
+All tuneable values live in `config/config.toml`. No magic constants in the code.
+
+```toml
+[ollama]
+host  = "http://localhost:11434"
+model = "qwen2.5:7b"          # change to any model you have pulled
+request_timeout = 120
+
+[agent]
+max_iterations = 10            # hard stop for the agentic loop
+
+[paths]
+ai_workspace = "/mnt/fedora-partition/drona-mcl/ai_workspace"
+log_file     = "/mnt/fedora-partition/drona-mcl/drona.log"
+```
+
+---
+
+## Docker
+
+Start Ollama + Drona in one command:
+
+```bash
+docker compose up -d ollama
+docker compose run --rm drona "Check which services are failing"
+```
+
+---
+
+## Architecture
+
+```
+main.py
+  └── core.agent.run_agent()
+        ├── ollama.Client.chat()          ← LLM call
+        ├── core.mcl.route()              ← MCL dispatch
+        │     ├── Path A: tool_calls field
+        │     └── Path B: core.parser.extract_tool_call()
+        └── tools.dispatch()              ← tool execution
+              ├── tools.system   (journalctl, systemctl, df, free)
+              ├── tools.network  (ss, ping, curl)
+              └── tools.scripts  (create, validate, execute, rollback)
+                    └── core.validator.validate_script()
+                          ├── bash -n  (syntax)
+                          └── ping-check heuristic (network safety)
+```
+
+---
+
+## Available tools
+
+| Tool | Description |
+|------|-------------|
+| `get_journal_logs` | Read systemd journal (optionally filtered by unit) |
+| `get_service_status` | `systemctl status` for a named unit |
+| `list_failed_services` | All units in a failed state |
+| `get_disk_usage` | `df -h` for all mounts or a specific path |
+| `get_memory_usage` | `free -h` |
+| `list_network_sockets` | `ss -tulnp` (open ports + processes) |
+| `ping_host` | ICMP reachability check with latency |
+| `curl_health_check` | HTTP GET status + truncated body |
+| `create_script` | Validate + write a bash script to `ai_workspace/` |
+| `execute_script` | User-confirmed script execution |
+| `rollback_script` | Restore script from `.bak` backup |
+| `list_scripts` | List all scripts in `ai_workspace/` |
+
+---
+
+## Script safety
+
+Every bash script generated by Drona passes two checks before being written to disk:
+
+1. **Syntax validation** — `bash -n` (real subprocess call, no execution)
+2. **Network-safety heuristic** — any script containing `mount`, `curl`, `wget`, `rsync`, `ssh`, `nfs`, `cifs`, or `smb` **must** have a `ping -c` connectivity check **before** the first network operation
+
+If either check fails, the write is aborted and the error is returned to the agent so it can reason about the failure.
+
+Execution of any script always requires explicit user confirmation (`yes` at the prompt).
+
+---
+
+## Running tests
+
+```bash
+source .venv/bin/activate
+pytest tests/ -v
+```
+
+The test suite requires no live Ollama connection and no root privileges.
+
+---
+
+## Project structure
+
+```
+drona-mcl/
+├── core/
+│   ├── agent.py          # Agentic loop
+│   ├── mcl.py            # Model Compliance Layer
+│   ├── parser.py         # Path B: fence stripping + JSON extraction
+│   ├── validator.py      # bash -n + ping-check heuristic
+│   └── config_loader.py  # Typed config from config.toml
+├── tools/
+│   ├── __init__.py       # Registry + dispatch()
+│   ├── system.py         # System introspection tools
+│   ├── network.py        # Network diagnostic tools
+│   └── scripts.py        # Script lifecycle tools
+├── config/
+│   └── config.toml
+├── tests/
+│   ├── test_parser.py
+│   ├── test_validator.py
+│   └── test_tools.py
+├── ai_workspace/         # Runtime script sandbox
+├── main.py
+├── setup.sh
+├── Dockerfile
+├── docker-compose.yml
+└── requirements.txt
+```
+
+---
+
+## Design decisions
+
+- **No LangChain / LlamaIndex.** The MCL is the framework. The point is to demonstrate that small models can be made reliable agentic participants with ~200 lines of parsing logic.
+- **No `shell=True`.** Every subprocess call uses list form. No user input is interpolated into command arguments.
+- **Errors as strings, not exceptions.** Tool functions return descriptive error strings to the agent loop so the model can reason about failures and decide next steps.
+- **Config in one place.** All tuneable values live in `config/config.toml`. No magic constants in code.
+
+---
+
+## License
+
+MIT

@@ -1,0 +1,56 @@
+# =============================================================================
+# Drona-MCL Configuration
+# All tuneable values live here. Never hardcode these in source files.
+# =============================================================================
+
+[ollama]
+# Base URL of the Ollama server. Change to a remote host if needed.
+host = "http://localhost:11434"
+# The model to use for the agentic loop.
+# Small models (3B-7B) often trigger Path B (non-compliant) MCL handling.
+model = "qwen3:4b-thinking"
+# Request timeout in seconds for a single Ollama API call.
+request_timeout = 120
+# Set to true when using a thinking-model variant (e.g. qwen3:4b, deepseek-r1).
+# This passes think=True to the Ollama client, which causes the server to
+# separate chain-of-thought into message.thinking and keep message.content
+# clean for the tool call or final answer. With think=false, thinking models
+# may dump their scratchpad into message.content, which corrupts Path A/B routing.
+think = true
+
+[agent]
+# Maximum number of tool-call iterations before the loop is forcibly terminated.
+# This is the primary safety guard against infinite loops.
+max_iterations = 10
+# System prompt injected at the start of every conversation.
+system_prompt = """
+You are Drona, a fully autonomous Linux SysAdmin agent.
+You MUST interact with the system EXCLUSIVELY through tool calls.
+Do not converse, explain, or summarize your thought process. 
+When generating a script, output ONLY the tool call.
+"""
+
+[paths]
+# Directory where all agent-generated scripts are written at runtime.
+# Must be an absolute path inside the project root.
+ai_workspace = "/mnt/fedora-partition/drona-mcl/ai_workspace"
+# Log file for the agent session (appended per run).
+log_file = "/mnt/fedora-partition/drona-mcl/drona.log"
+
+[validator]
+# Safety heuristics: tool calls requesting scripts that contain these patterns
+# without a preceding ping check will be flagged and rejected.
+# These are regex patterns matched against script content.
+network_operation_patterns = [
+    "\\bmount\\b",
+    "\\bcurl\\b",
+    "\\bwget\\b",
+    "\\brsync\\b.*@",
+    "\\bssh\\b",
+    "\\bnfs\\b",
+    "\\bcifs\\b",
+    "\\bsmb\\b",
+]
+# The ping check sentinel: if a script contains network operations, this
+# substring must appear somewhere above the first network operation.
+ping_sentinel = "ping -c"

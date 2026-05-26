@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Drona Specific
+ai_workspace/
+drona.log
+debug_model.py
+patch_config.py
+
+# OS
+.DS_Store

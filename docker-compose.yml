@@ -1,0 +1,78 @@
+---
+# docker-compose.yml — Drona-MCL: Ollama + Drona in one command
+#
+# Usage:
+#   docker compose up -d ollama          # start only Ollama
+#   docker compose run --rm drona "..."  # run a one-shot task
+#   docker compose up                    # start everything (interactive)
+#
+# Prerequisites:
+#   - Docker with Compose v2 (docker compose, not docker-compose)
+#   - NVIDIA GPU (optional): uncomment the gpu sections below
+#
+# Volumes:
+#   ollama_data   : persists downloaded models across container restarts
+#   ai_workspace  : bind-mounts the host ai_workspace into the Drona container
+#                   so generated scripts are accessible on the host
+
+version: "3.9"
+
+services:
+
+  # ── Ollama ─────────────────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: drona_ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"       # Ollama API — accessible at http://localhost:11434
+    volumes:
+      - ollama_data:/root/.ollama
+    # Uncomment for NVIDIA GPU acceleration:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Drona ──────────────────────────────────────────────────────────────────
+  drona:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: drona_agent
+    # Use host networking so Drona reaches the host's Ollama on localhost:11434
+    # (matches config.toml default). Override DRONA_OLLAMA_HOST if using a
+    # remote Ollama server.
+    network_mode: host
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      # Override config values via environment variables if needed.
+      # These are read by config_loader.py if present.
+      DRONA_OLLAMA_HOST: "http://localhost:11434"
+    volumes:
+      # Bind-mount ai_workspace so generated scripts persist on the host
+      - ./ai_workspace:/app/ai_workspace
+      # Mount config so you can tune settings without rebuilding the image
+      - ./config:/app/config:ro
+      # Mount logs to the host
+      - ./drona.log:/app/drona.log
+    stdin_open: true   # required for execute_script confirmation prompt
+    tty: true
+    # Default command — override with `docker compose run drona "your task"`
+    command: ["python", "main.py", "--help"]
+
+
+volumes:
+  ollama_data:
+    driver: local

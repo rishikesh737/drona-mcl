@@ -1,0 +1,14 @@
+# Drona-MCL dependencies
+# Install with: pip install -r requirements.txt
+#
+# Runtime dependencies
+ollama>=0.2.0          # Ollama Python client (Path A tool_calls + Path B chat)
+rich>=13.0.0           # Terminal output: panels, spinners, syntax highlighting
+
+# Test dependencies
+pytest>=8.0.0          # Test runner (required by project spec)
+pytest-mock>=3.12.0    # mocker fixture for mocking subprocess in tool tests
+
+# Python < 3.11 fallback (tomllib is stdlib in 3.11+)
+# Uncomment if you are running Python 3.10 or earlier:
+# tomli>=2.0.0
