@@ -1,114 +1,163 @@
 # Drona-MCL
 
-**Drona** is a fully local, autonomous Linux SysAdmin agent powered by small open-source models running via [Ollama](https://ollama.com). No data leaves your machine.
-
-Its defining innovation is the **Model Compliance Layer (MCL)** — a model-agnostic dispatch layer that makes small local models (3B–7B parameters) reliable agentic participants even when they don't follow the structured tool-calling API correctly.
+> **A fully local, autonomous Linux SysAdmin & Security Operations agent.**
+> Powered by small open-source models via [Ollama](https://ollama.com).
+> No data leaves your machine. Ever.
 
 ---
 
-## Why the MCL exists
+## What Drona Does
 
-Large Language Models exposed via the Ollama API support a structured tool-calling interface (`response.message.tool_calls`). In practice, small local models frequently ignore this schema and instead output raw JSON text, markdown-fenced JSON, or other freeform representations. This causes naive agentic systems to silently fail.
+Drona accepts a natural-language task, drives a locally-running LLM through a
+multi-turn agentic tool-calling loop, executes real system commands, and returns
+a verified final answer — with zero external API calls and zero cloud dependencies.
+
+**Phase 1 — SysAdmin Core:** Inspect services, read journals, check disk/memory,
+diagnose network, generate and execute validated bash scripts.
+
+**Phase 2 — Autonomous Security Operations Center (SOC):** Read host
+authentication and firewall logs via `journalctl`, and permanently block
+malicious IPs using `firewalld` rich DROP rules — all from a natural-language prompt.
+
+```
+$ python main.py "Read sshd logs and block any IP with repeated failures."
+
+╭── 🔧 Tool call (Path A) ──────────────────────────────╮
+│ read_security_logs({'service': 'sshd', 'lines': 200}) │
+│ === Security logs: sshd.service ===                   │
+│ Failed password for root from 203.0.113.42 (x47)     │
+╰────────────────────────────────────────────────────────╯
+╭── 🔧 Tool call (Path A) ──────────────────────────────╮
+│ block_malicious_ip({'ip_address': '203.0.113.42'})    │
+│ [OK] IP 203.0.113.42 (ipv4) blocked permanently.     │
+╰────────────────────────────────────────────────────────╯
+╭── ✓ Drona ─────────────────────────╮
+│ Blocked 203.0.113.42 permanently.  │
+╰─────────────────────────────────────╯
+```
+
+---
+
+## The Model Compliance Layer (MCL)
+
+The defining engineering contribution. Small local models (3B–7B) frequently
+ignore the Ollama structured `tool_calls` API and emit raw JSON, markdown-fenced
+JSON, or other freeform output. This causes naive agents to silently fail.
 
 The MCL handles **both** output styles:
 
 | Path | Trigger | Action |
 |------|---------|--------|
-| **Path A** (Compliant) | Model populates `tool_calls` field | Extracts and dispatches directly |
-| **Path B** (Non-Compliant) | Model outputs freeform text | Strips fences → extracts JSON → normalises schema → dispatches |
+| **Path A** (Compliant) | Model populates `tool_calls` | Extract & dispatch directly |
+| **Path B** (Non-Compliant) | Model emits freeform text | Strip fences → extract JSON → normalise schema → dispatch |
 
-### Fence variants handled by Path B
+**Fence variants handled (Path B):** backtick+language, bare backtick, triple-brace `{{{ }}}`, raw JSON, and prose-wrapped JSON.
 
-| # | Format | Example |
-|---|--------|---------|
-| 1 | Standard backtick + language tag | ` ```json { ... } ``` ` |
-| 2 | Backtick, no language tag | ` ``` { ... } ``` ` |
-| 3 | Triple-brace | `{{{ { ... } }}}` |
-| 4 | Raw JSON | `{ "name": ..., "arguments": ... }` |
-| 5 | Prose-wrapped | `"Sure! Here is the call: { ... }"` |
+**Schema normalisation:** `name/arguments`, `tool/parameters`, `function/arguments`, `function_name/arguments`, `action/action_input` (ReAct) — all normalised to canonical form.
 
-### Tool-call schema normalisation
+### Loop Stability — Duplicate Tool-Call Guard
 
-Different small models use different key names. The MCL normalises all of them:
-
-| Model output | Normalised to |
-|---|---|
-| `{"name": ..., "arguments": ...}` | canonical |
-| `{"tool": ..., "parameters": ...}` | ✓ |
-| `{"function": ..., "arguments": ...}` | ✓ |
-| `{"function_name": ..., "arguments": ...}` | ✓ |
-| `{"action": ..., "action_input": ...}` (ReAct) | ✓ |
+After each successful tool execution, the agent fingerprints the call
+(`tool_name` + sorted args → `frozenset`). If the model re-issues an
+identical call on the very next iteration — the classic infinite-loop
+failure mode — the guard intercepts, logs a warning, and exits gracefully
+with the prior successful output as a summary. The `[TIMEOUT]` hard cap
+becomes a last resort, not the norm.
 
 ---
 
-## Quick start
+## 5-Minute Podman Install (Fedora)
+
+Drona is packaged for **Podman** — the rootless, daemonless container runtime
+native to Fedora. No Docker daemon required.
 
 ### Prerequisites
 
-- Python 3.10+
-- [Ollama](https://ollama.com/download) installed and running
-- `bash` (for script validation)
-
-### 1. Clone and bootstrap
-
 ```bash
-git clone https://github.com/your-org/drona-mcl.git
-cd drona-mcl
-chmod +x setup.sh
-./setup.sh
+sudo dnf install podman podman-compose
+# Optional: NVIDIA GPU passthrough for faster inference
+sudo dnf install nvidia-container-toolkit
 ```
 
-`setup.sh` will:
-- Create a `.venv` virtual environment
-- Install all dependencies
-- Pull the configured Ollama model (`qwen2.5:7b` by default)
-- Run the test suite
-
-### 2. Activate the environment
+### Start the stack
 
 ```bash
+git clone https://github.com/your-org/drona-mcl.git && cd drona-mcl
+
+# Start Ollama (GPU-accelerated if available)
+podman-compose up -d ollama
+
+# Pull the model (~2 GB, first time only)
+podman-compose exec ollama ollama pull qwen3:4b-thinking
+
+# Run a task
+podman-compose run --rm drona "Check sshd logs and block repeated offenders."
+```
+
+Drona's container manages the **host's actual firewall** via a DBus socket
+passthrough — see [Privileged Container Orchestration](#privileged-container-orchestration).
+
+### Alternative: bare-metal
+
+```bash
+chmod +x setup.sh && ./setup.sh
 source .venv/bin/activate
-```
-
-### 3. Run Drona
-
-```bash
 python main.py "Why is nginx failing?"
-python main.py "Check disk usage on all mounts"
-python main.py "List all failed systemd services and their recent logs"
-python main.py --verbose "Create a script to rotate logs older than 30 days"
 ```
 
 ---
 
 ## Configuration
 
-All tuneable values live in `config/config.toml`. No magic constants in the code.
-
 ```toml
+# config/config.toml
 [ollama]
-host  = "http://localhost:11434"
-model = "qwen2.5:7b"          # change to any model you have pulled
+host            = "http://localhost:11434"
+model           = "qwen3:4b-thinking"
 request_timeout = 120
+think           = true   # separates chain-of-thought into message.thinking
 
 [agent]
-max_iterations = 10            # hard stop for the agentic loop
-
-[paths]
-ai_workspace = "/mnt/fedora-partition/drona-mcl/ai_workspace"
-log_file     = "/mnt/fedora-partition/drona-mcl/drona.log"
+max_iterations  = 10     # hard cap; duplicate-call guard exits before this
 ```
 
 ---
 
-## Docker
+## Available Tools
 
-Start Ollama + Drona in one command:
+### System (5)
+`get_journal_logs` · `get_service_status` · `list_failed_services` · `get_disk_usage` · `get_memory_usage`
 
-```bash
-docker compose up -d ollama
-docker compose run --rm drona "Check which services are failing"
-```
+### Network (3)
+`list_network_sockets` · `ping_host` · `curl_health_check`
+
+### Script Lifecycle (4)
+`create_script` · `execute_script` · `rollback_script` · `list_scripts`
+
+### Security / SOC (2) 🆕
+| Tool | Description |
+|------|-------------|
+| `read_security_logs` | `journalctl` for auth/security services (`sshd`, `firewalld`, `auditd`…). Service name validated against strict allowlist — path traversal and injection rejected before any subprocess. |
+| `block_malicious_ip` | Permanent `firewalld` DROP rule. Strict RFC 791 IPv4 + RFC 4291 IPv6 regex validation. Two-step: `--permanent` → `--reload`. CIDR, ports, hostnames rejected. |
+
+---
+
+## Script Safety
+
+Every agent-generated bash script passes two checks before touching disk:
+
+1. **`bash -n` syntax check** — real subprocess, zero execution
+2. **Network-safety heuristic** — `mount`, `curl`, `wget`, `rsync`, `ssh`, `nfs`, `cifs`, `smb` require a `ping -c` before the first network operation
+
+Failed checks return descriptive errors to the model for self-correction. Script execution always requires explicit `yes` at the prompt.
+
+---
+
+## Privileged Container Orchestration
+
+Drona manages the host firewall from inside its container through a **DBus socket passthrough**. The `podman-compose.yml` bind-mounts `/var/run/dbus/system_bus_socket` and sets `DBUS_SYSTEM_BUS_ADDRESS`. When `firewall-cmd` runs inside the container, its IPC message travels over that socket to the host's `firewalld` daemon — which is unaware it is being managed remotely.
+
+This is the same mechanism used by Cockpit and other system management tools. SELinux `:Z` labels are applied to all volume mounts to preserve the host's MAC policy. The container is **not** run with `--privileged`; it receives exactly the socket it needs and nothing more.
 
 ---
 
@@ -117,101 +166,67 @@ docker compose run --rm drona "Check which services are failing"
 ```
 main.py
   └── core.agent.run_agent()
-        ├── ollama.Client.chat()          ← LLM call
-        ├── core.mcl.route()              ← MCL dispatch
+        ├── ollama.Client.chat()          ← LLM call (think=True)
+        ├── core.mcl.route()             ← MCL dispatch
         │     ├── Path A: tool_calls field
+        │     │     └── duplicate-call guard (frozenset fingerprint) 🆕
         │     └── Path B: core.parser.extract_tool_call()
-        └── tools.dispatch()              ← tool execution
+        └── tools.dispatch()             ← tool execution
               ├── tools.system   (journalctl, systemctl, df, free)
               ├── tools.network  (ss, ping, curl)
-              └── tools.scripts  (create, validate, execute, rollback)
-                    └── core.validator.validate_script()
-                          ├── bash -n  (syntax)
-                          └── ping-check heuristic (network safety)
+              ├── tools.scripts  (create, validate, execute, rollback)
+              │     └── core.validator (bash -n + ping-check)
+              └── tools.security 🆕
+                    ├── read_security_logs  (journalctl auth reader)
+                    └── block_malicious_ip  (firewall-cmd via DBus)
 ```
 
 ---
 
-## Available tools
-
-| Tool | Description |
-|------|-------------|
-| `get_journal_logs` | Read systemd journal (optionally filtered by unit) |
-| `get_service_status` | `systemctl status` for a named unit |
-| `list_failed_services` | All units in a failed state |
-| `get_disk_usage` | `df -h` for all mounts or a specific path |
-| `get_memory_usage` | `free -h` |
-| `list_network_sockets` | `ss -tulnp` (open ports + processes) |
-| `ping_host` | ICMP reachability check with latency |
-| `curl_health_check` | HTTP GET status + truncated body |
-| `create_script` | Validate + write a bash script to `ai_workspace/` |
-| `execute_script` | User-confirmed script execution |
-| `rollback_script` | Restore script from `.bak` backup |
-| `list_scripts` | List all scripts in `ai_workspace/` |
-
----
-
-## Script safety
-
-Every bash script generated by Drona passes two checks before being written to disk:
-
-1. **Syntax validation** — `bash -n` (real subprocess call, no execution)
-2. **Network-safety heuristic** — any script containing `mount`, `curl`, `wget`, `rsync`, `ssh`, `nfs`, `cifs`, or `smb` **must** have a `ping -c` connectivity check **before** the first network operation
-
-If either check fails, the write is aborted and the error is returned to the agent so it can reason about the failure.
-
-Execution of any script always requires explicit user confirmation (`yes` at the prompt).
-
----
-
-## Running tests
-
-```bash
-source .venv/bin/activate
-pytest tests/ -v
-```
-
-The test suite requires no live Ollama connection and no root privileges.
-
----
-
-## Project structure
+## Project Structure
 
 ```
 drona-mcl/
 ├── core/
-│   ├── agent.py          # Agentic loop
+│   ├── agent.py          # Agentic loop + duplicate-call guard
 │   ├── mcl.py            # Model Compliance Layer
-│   ├── parser.py         # Path B: fence stripping + JSON extraction
+│   ├── parser.py         # Path B fence stripper + normaliser
 │   ├── validator.py      # bash -n + ping-check heuristic
-│   └── config_loader.py  # Typed config from config.toml
+│   └── config_loader.py
 ├── tools/
-│   ├── __init__.py       # Registry + dispatch()
-│   ├── system.py         # System introspection tools
-│   ├── network.py        # Network diagnostic tools
-│   └── scripts.py        # Script lifecycle tools
-├── config/
-│   └── config.toml
+│   ├── __init__.py       # TOOL_REGISTRY + TOOL_SCHEMAS + dispatch()
+│   ├── system.py
+│   ├── network.py
+│   ├── scripts.py
+│   └── security.py       # 🆕 SOC defense tools
+├── config/config.toml
 ├── tests/
-│   ├── test_parser.py
-│   ├── test_validator.py
-│   └── test_tools.py
-├── ai_workspace/         # Runtime script sandbox
+├── docs/architecture.md
+├── ai_workspace/
 ├── main.py
-├── setup.sh
-├── Dockerfile
-├── docker-compose.yml
-└── requirements.txt
+├── podman-compose.yml    # Podman + NVIDIA GPU + DBus passthrough
+└── Dockerfile
 ```
 
 ---
 
-## Design decisions
+## Design Decisions
 
-- **No LangChain / LlamaIndex.** The MCL is the framework. The point is to demonstrate that small models can be made reliable agentic participants with ~200 lines of parsing logic.
-- **No `shell=True`.** Every subprocess call uses list form. No user input is interpolated into command arguments.
-- **Errors as strings, not exceptions.** Tool functions return descriptive error strings to the agent loop so the model can reason about failures and decide next steps.
-- **Config in one place.** All tuneable values live in `config/config.toml`. No magic constants in code.
+- **No LangChain.** The MCL is the framework — ~200 lines make small models reliable.
+- **No `shell=True` anywhere.** Every subprocess uses list form.
+- **Errors as strings, not exceptions.** Tools return descriptive strings; the model reasons about failures.
+- **Podman, not Docker.** Native Fedora, rootless, SELinux-compatible.
+- **DBus passthrough, not `--privileged`.** Least privilege — exactly the socket needed.
+- **Config in one place.** `config/config.toml`. No magic constants.
+
+---
+
+## Running Tests
+
+```bash
+source .venv/bin/activate && pytest tests/ -v
+# No live Ollama required. No root required.
+```
 
 ---
 

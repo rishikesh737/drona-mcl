@@ -47,17 +47,17 @@ drona-mcl/
 ├── requirements.txt         # Runtime + test Python dependencies
 ├── setup.sh                 # Bootstrap: venv, deps, model pull, test run
 ├── Dockerfile               # Container image for the Drona agent process
-├── docker-compose.yml       # Orchestrates Ollama + Drona services
+├── podman-compose.yml       # Podman: Ollama + Drona + NVIDIA GPU + DBus passthrough
 ├── drona.log                # Session log file (appended per run, gitignored)
 ├── debug_model.py           # Ad-hoc script for probing raw Ollama responses
 ├── patch_config.py          # One-off utility for patching config.toml values
 │
 ├── config/
-│   └── config.toml          # All runtime tuneable values (model, timeouts, paths, validator patterns)
+│   └── config.toml          # All runtime tuneable values
 │
 ├── core/
-│   ├── __init__.py          # Package marker
-│   ├── agent.py             # Recursive agentic loop, Ollama calls, Rich UI rendering
+│   ├── __init__.py
+│   ├── agent.py             # Recursive agentic loop + duplicate-call guard
 │   ├── mcl.py               # Model Compliance Layer: Path A/B routing, tool dispatch
 │   ├── parser.py            # MCL Path B: fence stripping, JSON extraction, schema normalisation
 │   ├── validator.py         # bash -n syntax check + ping-c network safety heuristic
@@ -67,10 +67,11 @@ drona-mcl/
 │   ├── __init__.py          # TOOL_REGISTRY, TOOL_SCHEMAS, dispatch() function
 │   ├── system.py            # journalctl, systemctl, df, free wrappers
 │   ├── network.py           # ss, ping, curl wrappers
-│   └── scripts.py           # create/execute/rollback/list script lifecycle
+│   ├── scripts.py           # create/execute/rollback/list script lifecycle
+│   └── security.py          # 🆕 Phase 2: read_security_logs + block_malicious_ip
 │
 ├── tests/
-│   ├── __init__.py          # Package marker
+│   ├── __init__.py
 │   ├── test_parser.py       # 30+ tests: all fence variants, alt schemas, is_final_answer
 │   ├── test_validator.py    # 20+ tests: bash -n (real subprocess), all network patterns
 │   └── test_tools.py        # 30+ tests: system/network/scripts tools (mocked)
@@ -105,6 +106,25 @@ drona-mcl/
 | `_append_assistant_message()` | Appends assistant turn (with optional `tool_calls` key) to history |
 | `_render_tool_call()` | Rich Panel showing Path A/B badge, tool name, arguments, output preview |
 | `_render_final_answer()` | Green Rich Panel for the final answer |
+
+**Duplicate Tool-Call Guard (Phase 2):**
+
+A `previous_tool_calls: frozenset | None = None` state variable is maintained before the loop. After each Path A routing decision, the current tool calls are fingerprinted:
+
+```python
+current_tool_calls = frozenset(
+    (tr.tool_name, tuple(sorted(tr.arguments.items())))
+    for tr in mcl_result.tool_results
+)
+```
+
+The `sorted()` on argument items is critical — the model freely shuffles dict key order between otherwise-identical calls, so comparison must be order-insensitive. If `current == previous`, the guard intercepts before executing the tool again:
+
+1. Logs `[INFO] Duplicate tool call detected. Forcing graceful exit.`
+2. Surfaces the last successful tool output as a clean summary via `_render_final_answer()`.
+3. Returns immediately — the `[TIMEOUT]` hard cap is never reached for this case.
+
+This converts a 10-iteration `[TIMEOUT]` loop into a 2-iteration graceful exit.
 
 **Crash-proofing inside `with Live:`:**
 The spinner block catches three tiers:
@@ -236,7 +256,34 @@ Renders script via `rich.syntax.Syntax` (Monokai theme, line numbers) in a yello
 
 **`list_scripts()`:** Globs `ai_workspace/*.sh`, shows name (40-char padded), size, and `[has backup]` indicator.
 
-### 2.11 `config/config.toml` — Runtime Configuration
+### 2.11 `tools/security.py` — Autonomous Security Defense (2 tools) 🆕
+
+**Phase 2 addition.** Implements the Security Operations Center (SOC) capability.
+
+**`read_security_logs(service, lines)`:**
+- Calls `journalctl -n {lines} -u {service}.service --no-pager` via list-form subprocess (no `shell=True`).
+- Service name validated against `^[A-Za-z0-9_.\-]{1,64}$` before any subprocess is spawned — rejects path traversal (`../etc/passwd`) and shell injection (`rm -rf /`) at the validation layer.
+- `lines` clamped to 1–500 to prevent context-window flooding.
+- Strips trailing `.service` so callers may pass either `sshd` or `sshd.service`.
+
+**`block_malicious_ip(ip_address)`:**
+- Validates with strict RFC 791 IPv4 regex and RFC 4291 IPv6 regex (including compressed `::` and IPv4-mapped forms). CIDR, port suffixes, hostnames, and malformed inputs are rejected before any subprocess is created.
+- Auto-detects `family="ipv4"` vs `family="ipv6"` to construct the correct firewalld rich rule.
+- Two-step subprocess:
+  1. `sudo firewall-cmd --permanent --add-rich-rule=...` — writes to persistent storage.
+  2. `sudo firewall-cmd --reload` — activates in the running firewall.
+- Reload failure returns `[WARNING]` (not `[ERROR]`) — the rule is persisted and the operator is explicitly informed it will activate on next service restart.
+- The rich-rule string is passed as a **single list element** to `subprocess.run` — no shell interpolation occurs even though the string contains spaces.
+
+**Internal constants:**
+```python
+_MAX_LOG_LINES: int = 500
+_SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,64}$")
+_IPV4_RE  # strict per-octet 0–255 range check
+_IPV6_RE  # RFC 4291: full, compressed, and IPv4-mapped forms
+```
+
+### 2.12 `config/config.toml` — Runtime Configuration
 
 ```toml
 [ollama]
@@ -340,7 +387,8 @@ This accumulated history is the model's working memory. The model sees its own p
 
 **Termination conditions:**
 - `path == "final"` → clean return with the answer string.
-- `iteration > max_iterations` → `[TIMEOUT]` message; operator is advised to increase the limit or break the task into steps.
+- **Duplicate tool-call detected** → guard intercepts at iteration N+1, exits gracefully (Phase 2 addition).
+- `iteration > max_iterations` → `[TIMEOUT]` message; operator is advised to increase the limit or break the task.
 - Ollama connection error → `[ERROR]` string returned immediately; loop does not continue.
 
 ---
@@ -420,8 +468,10 @@ Type yes to execute, or anything else to cancel:
 | Python | 3.10+ | Runtime (3.11+ for stdlib `tomllib`) |
 | bash | Any | `bash -n` syntax validation |
 | Ollama | Latest | Local LLM inference server |
-| Docker + Compose v2 | Latest | Container deployment (optional) |
+| Podman + podman-compose | Latest | Container deployment (replaces Docker on Fedora) |
 | `iproute2`, `iputils-ping`, `curl` | Any | Tool subprocess dependencies |
+| `firewalld` | Any | Required on host for `block_malicious_ip` |
+| NVIDIA Container Toolkit | Optional | GPU passthrough for hardware-accelerated inference |
 
 ### 5.2 Host Setup via `setup.sh`
 
@@ -481,6 +531,38 @@ CMD ["--help"]
 ```
 
 Non-root `drona` user; system tools (`ss`, `ping`, `curl`, `bash`) installed at build time.
+
+### 5.4 Podman Deployment (Fedora — Phase 2)
+
+The production deployment migrated from Docker to **Podman** for full Fedora/RHEL compatibility — rootless mode, no daemon, and native SELinux integration.
+
+**Key `podman-compose.yml` additions over the original `docker-compose.yml`:**
+
+```yaml
+services:
+  ollama:
+    # NVIDIA GPU passthrough — hardware-accelerated inference
+    devices:
+      - /dev/nvidia0:/dev/nvidia0
+      - /dev/nvidiactl:/dev/nvidiactl
+      - /dev/nvidia-uvm:/dev/nvidia-uvm
+
+  drona:
+    # SELinux-compatible volume labels
+    volumes:
+      - ./ai_workspace:/app/ai_workspace:Z
+      - ./config:/app/config:ro,Z
+      - ./drona.log:/app/drona.log:Z
+    # DBus socket passthrough — grants firewall-cmd host access
+    environment:
+      DBUS_SYSTEM_BUS_ADDRESS: "unix:path=/var/run/dbus/system_bus_socket"
+    volumes:
+      - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:Z
+```
+
+The `:Z` suffix instructs Podman to relabel the bind-mount with the correct SELinux context for the container process — without it, the SELinux policy denies file access even with correct Unix permissions.
+
+The `DBUS_SYSTEM_BUS_ADDRESS` environment variable redirects `firewall-cmd`'s IPC calls from the non-existent in-container socket to the host socket. No changes to `firewall-cmd` itself are required.
 
 ---
 
@@ -631,6 +713,70 @@ jobs:
 - `patch_config.py` rewrites absolute paths in `config.toml` to CI-relative paths — prevents hardcoded `/mnt/fedora-partition/` from causing `FileNotFoundError` in CI.
 - `-x` flag — fails fast on first test failure for quick signal.
 - `--strict-markers` — enforces that all `@pytest.mark.*` decorators are declared in `pytest.ini`, preventing silent marker typos.
+
+---
+
+## 7. Privileged Container Orchestration — DBus Passthrough Architecture
+
+### 7.1 The Problem
+
+Drona Phase 2 required `tools/security.py` to execute `firewall-cmd` commands that modify the host machine's firewall policy. In a standard container deployment, this is impossible: the container runs in an isolated network and mount namespace, and `firewall-cmd` inside the container communicates with an in-container `firewalld` daemon that does not exist.
+
+Running the container with `--privileged` would grant full host capabilities — an unacceptable security regression.
+
+### 7.2 The Solution: DBus Socket Passthrough
+
+`firewalld` exposes its control interface via the D-Bus system message bus. The Unix domain socket for this bus lives at `/var/run/dbus/system_bus_socket` on the host. Any process with read/write access to this socket can send D-Bus messages to `firewalld` — regardless of whether it runs on the host or inside a container.
+
+The passthrough is implemented in two steps:
+
+**Step 1 — Bind-mount the socket:**
+```yaml
+volumes:
+  - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:Z
+```
+The `:Z` SELinux label ensures Podman relabels the mount with the correct context for the container's process domain.
+
+**Step 2 — Redirect the client:**
+```yaml
+environment:
+  DBUS_SYSTEM_BUS_ADDRESS: "unix:path=/var/run/dbus/system_bus_socket"
+```
+`libdbus` (used by `firewall-cmd`) reads this environment variable to locate the system bus. By pointing it at the bind-mounted socket, every `firewall-cmd` call inside the container sends its IPC message to the **host's** `firewalld` daemon.
+
+### 7.3 Request Flow
+
+```
+Drona container
+  └─ tools/security.py
+       └─ subprocess.run(["sudo", "firewall-cmd", "--permanent", "--add-rich-rule=..."])
+            └─ firewall-cmd binary
+                 └─ libdbus: connect to $DBUS_SYSTEM_BUS_ADDRESS
+                      └─ /var/run/dbus/system_bus_socket  ← bind-mounted host socket
+                           │
+                           │  (IPC message crosses container boundary)
+                           │
+                      Host kernel
+                           └─ /var/run/dbus/system_bus_socket  ← host socket
+                                └─ firewalld daemon (host PID namespace)
+                                     └─ nftables / iptables backend
+                                          └─ kernel netfilter → DROP rule installed
+```
+
+### 7.4 Security Properties
+
+| Property | Status |
+|---|---|
+| Container privilege level | **Unprivileged** — no `--privileged` flag |
+| Capability granted | DBus IPC to `firewalld` only |
+| `sudo` still required | ✅ — `firewall-cmd` requires `sudo`; sudoers controls the blast radius |
+| SELinux enforcing | ✅ — `:Z` volume labels preserve MAC policy |
+| Network namespace | Isolated — `host` mode only for Ollama reachability |
+| NVIDIA GPU | Device nodes bind-mounted individually (`/dev/nvidia0`, `/dev/nvidiactl`, `/dev/nvidia-uvm`) — no `--device all` |
+
+### 7.5 Why This Matters for Phase 3
+
+The DBus passthrough pattern generalises. Phase 3 (Web UI) can expose Drona's SOC capabilities through a browser interface without requiring the web server process to run with elevated privileges. The same socket passthrough makes the web container a thin control plane over the host's security infrastructure.
 
 ---
 

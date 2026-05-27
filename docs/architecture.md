@@ -41,9 +41,17 @@ core/agent.py  run_agent()
 tools/dispatch()   (tools/__init__.py)
   ├─ tools/system.py    (journalctl, systemctl, df, free)
   ├─ tools/network.py   (ping, ss, curl)
-  └─ tools/scripts.py   (create / execute / rollback / list)
-         └─ core/validator.py  (bash -n + ping-c heuristic)
+  ├─ tools/scripts.py   (create / execute / rollback / list)
+  │        └─ core/validator.py  (bash -n + ping-c heuristic)
+  └─ tools/security.py  🆕 (read_security_logs, block_malicious_ip)
+           ├─ journalctl          (auth/firewall log reader)
+           └─ firewall-cmd ←───── DBus socket passthrough
+                                  (host firewalld via container boundary)
 ```
+
+> **Phase 2 addition:** Path A now also runs the **duplicate-call guard** — a
+> `frozenset` fingerprint check that intercepts identical consecutive tool calls
+> and exits gracefully instead of re-executing or hitting `max_iterations`.
 
 ---
 
@@ -62,14 +70,19 @@ module-level config reads see the correct log level.
 The loop iterates up to `cfg.agent.max_iterations` times. Each iteration:
 
 1. Renders a spinner via `rich.live.Live` while waiting for Ollama.
-2. Calls `_call_ollama()` with `think=cfg.ollama.think`. The `think` flag
-   separates chain-of-thought into `message.thinking` for thinking-model
-   variants (qwen3, deepseek-r1), keeping `message.content` clean.
+2. Calls `_call_ollama()` with `think=cfg.ollama.think`.
 3. Passes the raw `ChatResponse` to `route()`.
-4. On Path A or B: appends the assistant turn + tool result messages and
-   continues.
+4. On Path A or B: runs the **duplicate-call guard**, then appends the assistant turn + tool result messages and continues.
 5. On `final`: renders the answer panel and returns.
 6. If `max_iterations` is exhausted: returns a `[TIMEOUT]` message.
+
+**Duplicate Tool-Call Guard (Phase 2):**
+A `previous_tool_calls: frozenset | None = None` state variable is initialised before the loop. After each Path A routing decision, each tool call is fingerprinted as `(tool_name, tuple(sorted(args.items())))` — the `sorted()` is essential because the model freely shuffles dict key order between otherwise-identical calls. If `current_fingerprint == previous_fingerprint`, the guard:
+1. Logs `[INFO] Duplicate tool call detected. Forcing graceful exit.`
+2. Renders the last successful tool output as a green `✓ Drona` summary panel.
+3. Returns immediately — no further LLM calls, no `[TIMEOUT]`.
+
+This converts a 10-iteration timeout into a 2-iteration graceful exit for the common "model re-issues the same successful tool call" pattern.
 
 **Crash-proofing:** `_call_ollama` is wrapped in three exception branches —
 `ollama.ResponseError`, `Exception` (connection errors), and `BaseException`
@@ -181,6 +194,26 @@ single atomic `curl -s -w "\n%{http_code}"` call, splitting stdout on the
 last newline to extract body and status code atomically — avoiding the
 two-request race condition of separate calls.
 
+### `tools/security.py` — Autonomous Security Defense 🆕
+Phase 2 addition. Two SOC-grade tools:
+
+**`read_security_logs(service, lines)`:** Fetches recent journal entries for a
+security-relevant service via `journalctl -n {lines} -u {service}.service
+--no-pager`. The service name is validated against a strict
+`^[A-Za-z0-9_.\-]{1,64}$` allowlist before any subprocess is spawned — path
+traversal and shell injection are rejected at the validation layer. Lines
+are clamped to 1–500.
+
+**`block_malicious_ip(ip_address)`:** Permanently blocks an IP via a firewalld
+rich DROP rule. Input is validated against strict RFC 791 IPv4 and RFC 4291
+IPv6 regexes — CIDR, ports, and hostnames are all rejected. The rule is written
+with `--permanent` (survives reboots) and activated with `--reload`. The
+rich-rule string is passed as a single `subprocess.run` list element — no shell
+interpolation occurs. On a reload failure, a `[WARNING]` is returned instead of
+a silent failure.
+
+---
+
 ### `tools/scripts.py` — Script Lifecycle Manager
 Full lifecycle: `create_script` → `execute_script` → `rollback_script`
 → `list_scripts`.
@@ -225,9 +258,61 @@ network_operation_patterns = ["\\bmount\\b", "\\bcurl\\b", ...]
 | Network safety gate | `ping -c` heuristic blocks unsafe network scripts |
 | Mandatory confirmation | `execute_script` requires interactive `yes` input |
 | Filename sanitisation | Path separators, null bytes, and length enforced |
-| Workspace isolation | All scripts confined to `ai_workspace`; path never from user input |
+| Workspace isolation | All scripts confined to `ai_workspace` |
 | Tool crash isolation | `try/except Exception` in MCL wraps every `dispatch()` call |
 | Iteration guard | `max_iterations` terminates runaway loops unconditionally |
+| Duplicate-call guard 🆕 | `frozenset` fingerprint exits gracefully before re-executing identical calls |
+| IP validation 🆕 | Strict IPv4/IPv6 regex; CIDR, ports, hostnames rejected before subprocess |
+| Service name allowlist 🆕 | `^[A-Za-z0-9_.\-]{1,64}$` blocks path traversal and injection in log reads |
+| No `shell=True` | Every subprocess call uses list form — everywhere in the codebase |
+| DBus socket passthrough 🆕 | Container manages host firewall via IPC socket — not `--privileged` |
+| SELinux `:Z` mounts 🆕 | Podman relabels volume mounts; host MAC policy remains enforced |
+
+---
+
+## Privileged Container Orchestration 🆕
+
+Drona Phase 2 deploys inside a **Podman** container yet manages the host
+machine's firewall. This is achieved through a **DBus socket passthrough**
+rather than running the container with `--privileged`.
+
+### Mechanism
+
+The host's D-Bus system bus socket
+(`/var/run/dbus/system_bus_socket`) is bind-mounted into the container with an
+SELinux `:Z` label. The `DBUS_SYSTEM_BUS_ADDRESS` environment variable is set
+to point `libdbus` (and thus `firewall-cmd`) at this socket:
+
+```yaml
+# podman-compose.yml
+drona:
+  volumes:
+    - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:Z
+  environment:
+    DBUS_SYSTEM_BUS_ADDRESS: "unix:path=/var/run/dbus/system_bus_socket"
+```
+
+When `block_malicious_ip` calls `firewall-cmd`, the IPC message travels
+over the bind-mounted socket, crosses the container boundary, and is delivered
+to the host's `firewalld` daemon. From `firewalld`'s perspective, this is
+indistinguishable from any other local D-Bus client call.
+
+### Request path
+
+```
+Drona container
+  └─ tools/security.py → subprocess.run(["sudo", "firewall-cmd", ...])
+       └─ firewall-cmd → libdbus → $DBUS_SYSTEM_BUS_ADDRESS
+            └─ bind-mounted socket ←───── container boundary ──────► host socket
+                 └─ firewalld (host PID ns) → nftables → DROP rule
+```
+
+### Hardware passthrough (NVIDIA GPU)
+
+The Ollama service also benefits from hardware passthrough: the NVIDIA device
+nodes (`/dev/nvidia0`, `/dev/nvidiactl`, `/dev/nvidia-uvm`) are bind-mounted
+individually — not via `--device all` — keeping the principle of least privilege
+for hardware access too.
 
 ---
 
@@ -238,3 +323,4 @@ network_operation_patterns = ["\\bmount\\b", "\\bcurl\\b", ...]
 | `tests/test_parser.py` | All 5 fence variants, 6 alt schemas, `is_final_answer`, edge cases |
 | `tests/test_validator.py` | `bash -n` (real subprocess), all network patterns, ping ordering |
 | `tests/test_tools.py` | system/network/scripts tools (mocked subprocess + tmp_path) |
+| `tools/security.py` (isolation tests) | IPv4/IPv6 validation (13 cases), service allowlist, injection rejection, subprocess guard |
