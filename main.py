@@ -89,9 +89,14 @@ def main() -> int:
 
     # Import here so logging is configured before module-level code runs
     from core.agent import run_agent  # noqa: PLC0415
+    import asyncio
+
+    async def _run():
+        async for _ in run_agent(task):
+            pass
 
     try:
-        run_agent(task)
+        asyncio.run(_run())
         return 0
     except KeyboardInterrupt:
         _console.print("\n[yellow]Interrupted by user.[/yellow]")

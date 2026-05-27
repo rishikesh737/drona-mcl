@@ -11,5 +11,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the agent codebase
 COPY . .
 
-# Keep the container running infinitely in the background so we can dispatch tasks to it
-ENTRYPOINT ["tail", "-f", "/dev/null"]
+# Start the FastAPI server for the Web UI streaming API
+ENTRYPOINT ["uvicorn", "api.server:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -23,7 +23,9 @@ services:
     container_name: drona-agent
     privileged: true      
     network_mode: "host"  
-    pid: "host"           
+    pid: "host"
+    ports:
+      - "8000:8000"
     environment:
       # Force system tools to talk to the host's DBus
       - DBUS_SYSTEM_BUS_ADDRESS=unix:path=/var/run/dbus/system_bus_socket

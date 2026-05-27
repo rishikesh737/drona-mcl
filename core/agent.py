@@ -17,8 +17,9 @@ delegated to the MCL and the tool registry.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import Any
+from typing import Any, AsyncGenerator
 
 import ollama
 from rich.console import Console
@@ -122,19 +123,6 @@ def _call_ollama(
     request_timeout: int,
     think: bool = False,
 ) -> ollama.ChatResponse:
-    """Make a single Ollama chat call.
-
-    Args:
-        think: When True, passes think=True to the Ollama client so that
-               thinking-model variants (qwen3, deepseek-r1, etc.) separate
-               their chain-of-thought into message.thinking and keep
-               message.content clean for the tool call or final answer.
-               Read from cfg.ollama.think at the call site.
-
-    Raises:
-        ollama.ResponseError: On API-level errors (propagated to run_agent).
-        Exception: On connection errors (propagated to run_agent).
-    """
     return client.chat(
         model=model,
         messages=messages,
@@ -160,27 +148,43 @@ def _append_assistant_message(
 # ---------------------------------------------------------------------------
 
 
-def run_agent(task: str) -> str:
+def _call_ollama_sync(
+    client: ollama.Client,
+    model: str,
+    messages: list[dict[str, Any]],
+    think: bool = False,
+) -> ollama.ChatResponse:
+    return client.chat(
+        model=model,
+        messages=messages,
+        tools=TOOL_SCHEMAS,
+        think=think,
+    )
+
+class _FakeMessage:
+    def __init__(self, content: str, thinking: str | None, tool_calls: list[Any] | None):
+        self.role = "assistant"
+        self.content = content
+        self.thinking = thinking
+        self.tool_calls = tool_calls
+
+class _FakeResponse:
+    def __init__(self, msg: _FakeMessage):
+        self.message = msg
+
+async def run_agent(task: str) -> AsyncGenerator[dict[str, Any], None]:
     """Run the Drona agentic loop for a given sysadmin *task*.
 
-    This is the sole public entry point consumed by main.py. It:
-      - Loads config.
-      - Initialises the Ollama client.
-      - Runs the MCL-driven agentic loop.
-      - Returns the final answer string.
-
-    Args:
-        task: Natural-language sysadmin task from the user.
-
-    Returns:
-        The model's final answer, or an error/timeout message.
+    Yields:
+        Dictionaries containing state updates, tokens, and tool results
+        for downstream streaming consumers.
     """
     cfg = load_config()
     session_log = _get_file_logger(cfg)
 
     session_log.info("=== New session | task: %s", task)
 
-    client = ollama.Client(host=cfg.ollama.host)
+    client = ollama.AsyncClient(host=cfg.ollama.host)
     messages = _build_initial_messages(cfg.agent.system_prompt, task)
 
     _console.print()
@@ -192,46 +196,74 @@ def run_agent(task: str) -> str:
         )
     )
 
+    yield {"type": "start", "task": task}
+
     # Tracks the canonical fingerprint of the previous iteration's tool calls.
     # A frozenset of (tool_name, frozen_args) tuples; None on the first pass.
     previous_tool_calls: frozenset | None = None
 
     for iteration in range(1, cfg.agent.max_iterations + 1):
         _render_iteration_header(iteration, cfg.agent.max_iterations)
+        yield {"type": "iteration", "iteration": iteration, "max_iterations": cfg.agent.max_iterations}
 
         # ── LLM call with spinner ────────────────────────────────────────
-        response: ollama.ChatResponse
-        with Live(
-            Spinner("dots", text=Text(" Thinking…", style="dim")),
-            console=_console,
-            refresh_per_second=10,
-        ):
-            try:
-                response = _call_ollama(
-                    client,
-                    cfg.ollama.model,
-                    messages,
-                    cfg.ollama.request_timeout,
-                    think=cfg.ollama.think,
+        raw_content = ""
+        thinking_content = ""
+        tool_calls = []
+
+        try:
+            stream = await client.chat(
+                model=cfg.ollama.model,
+                messages=messages,
+                tools=TOOL_SCHEMAS,
+                think=cfg.ollama.think,
+                stream=True,
+            )
+            with Live(
+                Spinner("dots", text=Text(" Thinking…", style="dim")),
+                console=_console,
+                refresh_per_second=10,
+            ):
+                async for chunk in stream:
+                    msg = chunk.message
+                    if getattr(msg, "content", None):
+                        raw_content += msg.content
+                        yield {"type": "token", "content": msg.content}
+                    if getattr(msg, "thinking", None):
+                        thinking_content += msg.thinking
+                        yield {"type": "think_token", "content": msg.thinking}
+                    if getattr(msg, "tool_calls", None):
+                        tool_calls.extend(msg.tool_calls)
+            
+            response = _FakeResponse(
+                _FakeMessage(
+                    content=raw_content,
+                    thinking=thinking_content if thinking_content else None,
+                    tool_calls=tool_calls if tool_calls else None
                 )
-            except ollama.ResponseError as exc:
-                err = f"[ERROR] Ollama API error: {exc}"
-                session_log.error(err)
-                _console.print(f"[red]{err}[/red]")
-                return err
-            except Exception as exc:  # noqa: BLE001
-                err = (
-                    f"[ERROR] Could not connect to Ollama at "
-                    f"'{cfg.ollama.host}'. Is Ollama running?\nDetail: {exc}"
-                )
-                session_log.error(err)
-                _console.print(f"[red]{err}[/red]")
-                return err
-            except BaseException as exc:
-                err = f"[ERROR] Uncaught exception during LLM call: {exc}"
-                session_log.error(err)
-                _console.print(f"[red]{err}[/red]")
-                return err
+            )
+
+        except ollama.ResponseError as exc:
+            err = f"[ERROR] Ollama API error: {exc}"
+            session_log.error(err)
+            _console.print(f"[red]{err}[/red]")
+            yield {"type": "error", "content": err}
+            return
+        except Exception as exc:  # noqa: BLE001
+            err = (
+                f"[ERROR] Could not connect to Ollama at "
+                f"'{cfg.ollama.host}'. Is Ollama running?\nDetail: {exc}"
+            )
+            session_log.error(err)
+            _console.print(f"[red]{err}[/red]")
+            yield {"type": "error", "content": err}
+            return
+        except BaseException as exc:
+            err = f"[ERROR] Uncaught exception during LLM call: {exc}"
+            session_log.error(err)
+            _console.print(f"[red]{err}[/red]")
+            yield {"type": "error", "content": err}
+            return
 
         # ── MCL routing ──────────────────────────────────────────────────
         mcl_result: MCLResult = route(response)
@@ -246,7 +278,8 @@ def run_agent(task: str) -> str:
         if mcl_result.path == "final":
             _render_final_answer(mcl_result.final_text)
             session_log.info("Final answer returned after %d iteration(s).", iteration)
-            return mcl_result.final_text
+            yield {"type": "final_answer", "content": mcl_result.final_text}
+            return
 
         # ── Tool call(s) dispatched ──────────────────────────────────────
 
@@ -288,7 +321,8 @@ def run_agent(task: str) -> str:
                 "Graceful exit after duplicate detected at iteration %d.",
                 iteration,
             )
-            return summary
+            yield {"type": "final_answer", "content": summary}
+            return
 
         # Update state for the next iteration.
         previous_tool_calls = current_tool_calls
@@ -305,6 +339,13 @@ def run_agent(task: str) -> str:
         tool_messages = build_tool_result_messages(mcl_result)
         for tr in mcl_result.tool_results:
             _render_tool_call(mcl_result.path, tr)
+            yield {
+                "type": "tool_call",
+                "path": mcl_result.path,
+                "tool_name": tr.tool_name,
+                "arguments": tr.arguments,
+                "output": tr.output
+            }
             session_log.info(
                 "Tool '%s' returned: %s",
                 tr.tool_name,
@@ -322,4 +363,5 @@ def run_agent(task: str) -> str:
     )
     session_log.warning(timeout_msg)
     _console.print(f"[bold yellow]{timeout_msg}[/bold yellow]")
-    return timeout_msg
+    yield {"type": "error", "content": timeout_msg}
+    return

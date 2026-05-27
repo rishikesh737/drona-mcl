@@ -12,3 +12,8 @@ pytest-mock>=3.12.0    # mocker fixture for mocking subprocess in tool tests
 # Python < 3.11 fallback (tomllib is stdlib in 3.11+)
 # Uncomment if you are running Python 3.10 or earlier:
 # tomli>=2.0.0
+
+# API / Web UI dependencies (Phase 3)
+fastapi>=0.110.0
+uvicorn>=0.29.0
+websockets>=12.0
