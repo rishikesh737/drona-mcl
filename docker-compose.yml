@@ -1,78 +1,38 @@
----
-# docker-compose.yml — Drona-MCL: Ollama + Drona in one command
-#
-# Usage:
-#   docker compose up -d ollama          # start only Ollama
-#   docker compose run --rm drona "..."  # run a one-shot task
-#   docker compose up                    # start everything (interactive)
-#
-# Prerequisites:
-#   - Docker with Compose v2 (docker compose, not docker-compose)
-#   - NVIDIA GPU (optional): uncomment the gpu sections below
-#
-# Volumes:
-#   ollama_data   : persists downloaded models across container restarts
-#   ai_workspace  : bind-mounts the host ai_workspace into the Drona container
-#                   so generated scripts are accessible on the host
-
-version: "3.9"
+version: '3.8'
 
 services:
-
-  # ── Ollama ─────────────────────────────────────────────────────────────────
+  # 1. The Local AI Brain (GPU Accelerated)
   ollama:
-    image: ollama/ollama:latest
-    container_name: drona_ollama
+    image: docker.io/ollama/ollama:latest
+    container_name: drona-ollama
+    network_mode: "host" 
+    volumes:
+      - /mnt/fedora-partition/ollama-models:/root/.ollama:Z
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     restart: unless-stopped
-    ports:
-      - "11434:11434"       # Ollama API — accessible at http://localhost:11434
-    volumes:
-      - ollama_data:/root/.ollama
-    # Uncomment for NVIDIA GPU acceleration:
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: all
-    #           capabilities: [gpu]
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
 
-  # ── Drona ──────────────────────────────────────────────────────────────────
+  # 2. The Autonomous SysAdmin Agent
   drona:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: drona_agent
-    # Use host networking so Drona reaches the host's Ollama on localhost:11434
-    # (matches config.toml default). Override DRONA_OLLAMA_HOST if using a
-    # remote Ollama server.
-    network_mode: host
-    depends_on:
-      ollama:
-        condition: service_healthy
+    build: .
+    container_name: drona-agent
+    privileged: true      
+    network_mode: "host"  
+    pid: "host"           
     environment:
-      # Override config values via environment variables if needed.
-      # These are read by config_loader.py if present.
-      DRONA_OLLAMA_HOST: "http://localhost:11434"
+      # Force system tools to talk to the host's DBus
+      - DBUS_SYSTEM_BUS_ADDRESS=unix:path=/var/run/dbus/system_bus_socket
     volumes:
-      # Bind-mount ai_workspace so generated scripts persist on the host
-      - ./ai_workspace:/app/ai_workspace
-      # Mount config so you can tune settings without rebuilding the image
-      - ./config:/app/config:ro
-      # Mount logs to the host
-      - ./drona.log:/app/drona.log
-    stdin_open: true   # required for execute_script confirmation prompt
-    tty: true
-    # Default command — override with `docker compose run drona "your task"`
-    command: ["python", "main.py", "--help"]
-
-
-volumes:
-  ollama_data:
-    driver: local
+      - ./ai_workspace:/app/ai_workspace:Z
+      - ./config:/app/config:Z
+      # The God-Mode systemd passthroughs:
+      - /run/systemd:/run/systemd
+      - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket
+      - /var/log/journal:/var/log/journal:ro
+    depends_on:
+      - ollama
