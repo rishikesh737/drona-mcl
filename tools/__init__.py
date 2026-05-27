@@ -53,6 +53,10 @@ from tools.scripts import (
     rollback_script,
     list_scripts,
 )
+from tools.security import (
+    read_security_logs,
+    block_malicious_ip,
+)
 
 # ---------------------------------------------------------------------------
 # Schema definitions
@@ -302,6 +306,65 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
         },
     },
+    # ── security.py ─────────────────────────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "read_security_logs",
+            "description": (
+                "Fetch recent journal logs for a security-relevant systemd "
+                "service (e.g. sshd, firewalld, auditd, fail2ban). "
+                "Use this to investigate brute-force attempts, auth failures, "
+                "or firewall events before taking defensive action."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "service": {
+                        "type": "string",
+                        "description": (
+                            "Systemd service name without the .service suffix "
+                            "(e.g. 'sshd', 'firewalld', 'auditd'). "
+                            "Only alphanumeric characters, hyphens, underscores, "
+                            "and dots are permitted."
+                        ),
+                    },
+                    "lines": {
+                        "type": "integer",
+                        "description": "Number of most-recent log lines to return (1–500). Default: 100.",
+                    },
+                },
+                "required": ["service"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "block_malicious_ip",
+            "description": (
+                "Permanently block a malicious IPv4 or IPv6 address using a "
+                "firewalld rich DROP rule. Runs firewall-cmd --permanent then "
+                "--reload so the block survives reboots and is immediately active. "
+                "The IP is validated by regex before any command is executed; "
+                "hostnames, CIDR ranges, and ports are rejected."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ip_address": {
+                        "type": "string",
+                        "description": (
+                            "A valid IPv4 (e.g. '192.168.1.100') or IPv6 "
+                            "(e.g. '2001:db8::1') address to block. "
+                            "Must be a bare IP with no port or CIDR suffix."
+                        ),
+                    },
+                },
+                "required": ["ip_address"],
+            },
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -322,6 +385,8 @@ TOOL_REGISTRY: dict[str, Callable[..., str]] = {
     "execute_script": execute_script,
     "rollback_script": rollback_script,
     "list_scripts": list_scripts,
+    "read_security_logs": read_security_logs,
+    "block_malicious_ip": block_malicious_ip,
 }
 
 #: Full OpenAI-schema list passed to ollama client as ``tools=``.

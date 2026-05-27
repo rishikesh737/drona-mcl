@@ -8,7 +8,9 @@ iterates as follows:
   2. Pass the response to the MCL router.
   3. If the MCL returns a tool result → append the tool messages and loop.
   4. If the MCL returns a final answer → return it to the caller.
-  5. If max_iterations is reached → force-stop and return a timeout notice.
+  5. If a duplicate tool call is detected (same name + identical args as the
+     immediately preceding iteration) → intercept and force graceful exit.
+  6. If max_iterations is reached → force-stop and return a timeout notice.
 
 The agent loop has no knowledge of specific tools; all tool dispatch is
 delegated to the MCL and the tool registry.
@@ -190,6 +192,10 @@ def run_agent(task: str) -> str:
         )
     )
 
+    # Tracks the canonical fingerprint of the previous iteration's tool calls.
+    # A frozenset of (tool_name, frozen_args) tuples; None on the first pass.
+    previous_tool_calls: frozenset | None = None
+
     for iteration in range(1, cfg.agent.max_iterations + 1):
         _render_iteration_header(iteration, cfg.agent.max_iterations)
 
@@ -243,6 +249,50 @@ def run_agent(task: str) -> str:
             return mcl_result.final_text
 
         # ── Tool call(s) dispatched ──────────────────────────────────────
+
+        # Build a canonical fingerprint of this iteration's tool calls.
+        # Arguments are converted to a sorted tuple of items so that key
+        # ordering differences (which the model produces freely) do not
+        # produce false negatives.
+        current_tool_calls: frozenset = frozenset(
+            (
+                tr.tool_name,
+                tuple(sorted(tr.arguments.items()))
+                if isinstance(tr.arguments, dict)
+                else repr(tr.arguments),
+            )
+            for tr in mcl_result.tool_results
+        )
+
+        # ── Duplicate tool-call guard ────────────────────────────────────
+        if current_tool_calls == previous_tool_calls:
+            dup_msg = (
+                "Duplicate tool call detected (identical name + args as "
+                "previous iteration). Forcing graceful exit."
+            )
+            session_log.info(dup_msg)
+            _console.print(
+                f"[bold yellow]⚠ {dup_msg}[/bold yellow]"
+            )
+            # Surface the last successful tool output as a clean summary.
+            last_outputs = "\n".join(
+                f"• {tr.tool_name}: {tr.output.splitlines()[0]}"
+                for tr in mcl_result.tool_results
+            )
+            summary = (
+                f"Task complete. The following tool(s) executed successfully "
+                f"on the previous iteration:\n{last_outputs}"
+            )
+            _render_final_answer(summary)
+            session_log.info(
+                "Graceful exit after duplicate detected at iteration %d.",
+                iteration,
+            )
+            return summary
+
+        # Update state for the next iteration.
+        previous_tool_calls = current_tool_calls
+
         # Append assistant turn
         native_tool_calls = getattr(response.message, "tool_calls", None)
         _append_assistant_message(
