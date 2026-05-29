@@ -5,12 +5,20 @@ import json
 import logging
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+from pathlib import Path
 
 from core.agent import run_agent
 
 logger = logging.getLogger("api.server")
 app = FastAPI(title="Drona-MCL Streaming API")
 
+BASE_DIR = Path(__file__).parent.parent
+
+@app.get("/")
+async def get_dashboard() -> FileResponse:
+    """Serve the React dashboard on the root endpoint."""
+    return FileResponse(BASE_DIR / "frontend" / "index.html")
 
 @app.websocket("/ws/chat")
 async def chat_endpoint(websocket: WebSocket) -> None:

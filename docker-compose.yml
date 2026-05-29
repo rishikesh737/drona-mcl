@@ -32,6 +32,7 @@ services:
     volumes:
       - ./ai_workspace:/app/ai_workspace:Z
       - ./config:/app/config:Z
+      - ./frontend:/app/frontend:Z
       # The God-Mode systemd passthroughs:
       - /run/systemd:/run/systemd
       - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket
